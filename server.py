@@ -300,25 +300,118 @@ def get_auth_headers(oauth_token: str | None = None) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def build_oauth1_client() -> OAuth1Client:
+def build_auth_client():
+    """
+    Build authentication headers preferring OAuth2 over OAuth1.
+    Returns a dict of headers to use for API requests.
+    Automatically refreshes OAuth2 access tokens using the refresh token.
+    """
+    import time as time_module
+
+    # Try OAuth2 first (preferred for persistent auth without browser)
+    client_id = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
+    oauth2_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    refresh_token = os.getenv("X_OAUTH_REFRESH_TOKEN", "").strip()
+
+    # If we have OAuth2 credentials but no access token, try to refresh
+    if client_id and client_secret and refresh_token and not oauth2_token:
+        print("No access token found, attempting to refresh using refresh token...")
+        new_access_token = _refresh_oauth2_token(client_id, client_secret, refresh_token)
+        if new_access_token:
+            oauth2_token = new_access_token
+            # Optionally update the env var for this session
+            os.environ["X_OAUTH_ACCESS_TOKEN"] = new_access_token
+
+    if client_id and client_secret and oauth2_token:
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("Using OAuth2 bearer token authentication")
+        LOGGER.info("Using OAuth2 bearer token authentication")
+        return {"Authorization": f"Bearer {oauth2_token}"}
+
+    # Fall back to OAuth1
     consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
     consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET")
     if not consumer_key or not consumer_secret:
         raise RuntimeError(
             "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
         )
+
+    # Check for pre-existing OAuth1 tokens first (for stdio mode / Cline integration)
+    env_access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    env_access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
+
+    if env_access_token and env_access_secret:
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("Using pre-existing OAuth1 access token:", env_access_token)
+        LOGGER.info("Using pre-existing OAuth1 access token: %s", env_access_token)
+        return {
+            "client_key": consumer_key,
+            "client_secret": consumer_secret,
+            "resource_owner_key": env_access_token,
+            "resource_owner_secret": env_access_secret,
+        }
+
+    # Fall back to browser-based OAuth1 flow
     access_token, access_secret = run_oauth1_flow()
     if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
         print("OAuth1 access token:", access_token)
         print("OAuth1 access token secret:", access_secret)
     LOGGER.info("OAuth1 access token: %s", access_token)
-    return OAuth1Client(
-        client_key=consumer_key,
-        client_secret=consumer_secret,
-        resource_owner_key=access_token,
-        resource_owner_secret=access_secret,
-        signature_type="AUTH_HEADER",
-    )
+    return {
+        "client_key": consumer_key,
+        "client_secret": consumer_secret,
+        "resource_owner_key": access_token,
+        "resource_owner_secret": access_secret,
+    }
+
+
+def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str) -> str | None:
+    """
+    Refresh an OAuth2 access token using the refresh token.
+    Returns the new access token, or None if refresh failed.
+    """
+    import base64
+
+    token_url = "https://api.x.com/2/oauth2/token"
+
+    # Create Basic auth header with client credentials
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+
+    headers = {
+        "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    try:
+        response = requests.post(token_url, headers=headers, data=data, timeout=30)
+        response.raise_for_status()
+        token_data = response.json()
+
+        new_access_token = token_data.get("access_token")
+        new_refresh_token = token_data.get("refresh_token")
+
+        if new_access_token:
+            print("Successfully refreshed OAuth2 access token")
+            if new_refresh_token:
+                print("Received new refresh token (updating...)")
+                # Note: In production, you'd want to persist this
+                # For now, we'll just use it for this session
+            return new_access_token
+        else:
+            print("Token refresh response did not contain access_token")
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to refresh OAuth2 token: {e}")
+        LOGGER.error("OAuth2 token refresh failed: %s", e)
+        return None
 
 
 def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> None:
@@ -345,10 +438,40 @@ def create_mcp() -> FastMCP:
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
 
-    oauth1_client = build_oauth1_client()
+    auth_config = build_auth_client()
     print_oauth_header = is_truthy(os.getenv("X_OAUTH_PRINT_AUTH_HEADER", "0"))
-    if print_oauth_header:
-        print_oauth1_header_probe(oauth1_client, base_url)
+
+    # Determine if we're using OAuth2 or OAuth1
+    is_oauth2 = isinstance(auth_config, dict) and "Authorization" in auth_config and auth_config.get("Authorization", "").startswith("Bearer ")
+
+    if is_oauth2:
+        # OAuth2: use bearer token directly
+        oauth2_token = auth_config["Authorization"].replace("Bearer ", "")
+        client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {oauth2_token}"},
+            timeout=timeout,
+            event_hooks={
+                "request": [normalize_query_params, log_request],
+                "response": [log_response],
+            },
+        )
+        return FastMCP.from_openapi(
+            openapi_spec=filtered_spec,
+            client=client,
+            name="X API MCP",
+        )
+    else:
+        # OAuth1: build OAuth1Client from the returned config
+        oauth1_client = OAuth1Client(
+            client_key=auth_config["client_key"],
+            client_secret=auth_config["client_secret"],
+            resource_owner_key=auth_config["resource_owner_key"],
+            resource_owner_secret=auth_config["resource_owner_secret"],
+            signature_type="AUTH_HEADER",
+        )
+        if print_oauth_header:
+            print_oauth1_header_probe(oauth1_client, base_url)
 
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
@@ -451,11 +574,17 @@ def create_mcp() -> FastMCP:
     )
 
 
+
+
 def main() -> None:
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
+    transport = os.getenv("MCP_TRANSPORT", "http")
     mcp = create_mcp()
-    mcp.run(transport="http", host=host, port=port)
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="http", host=host, port=port)
 
 
 if __name__ == "__main__":
