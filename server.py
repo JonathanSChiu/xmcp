@@ -306,28 +306,45 @@ def build_auth_client():
     Returns a dict of headers to use for API requests.
     Automatically refreshes OAuth2 access tokens using the refresh token.
     """
-    import time as time_module
-
     # Try OAuth2 first (preferred for persistent auth without browser)
     client_id = os.getenv("CLIENT_ID", "").strip()
     client_secret = os.getenv("CLIENT_SECRET", "").strip()
     oauth2_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
     refresh_token = os.getenv("X_OAUTH_REFRESH_TOKEN", "").strip()
 
-    # If we have OAuth2 credentials but no access token, try to refresh
-    if client_id and client_secret and refresh_token and not oauth2_token:
-        print("No access token found, attempting to refresh using refresh token...")
+    # Diagnostic: Show which credentials are detected
+    print("=" * 60)
+    print("OAUTH2 CREDENTIALS DETECTION:")
+    print(f"  CLIENT_ID present: {bool(client_id)}")
+    print(f"  CLIENT_SECRET present: {bool(client_secret)}")
+    print(f"  X_OAUTH_REFRESH_TOKEN present: {bool(refresh_token)}")
+    print(f"  X_OAUTH_ACCESS_TOKEN present: {bool(oauth2_token)}")
+    print("=" * 60)
+
+    # If we have OAuth2 credentials and a refresh token, always try to refresh
+    # This ensures we get a fresh token on every startup
+    if client_id and client_secret and refresh_token:
+        print(">>> ATTEMPTING OAUTH2 TOKEN REFRESH <<<")
         new_access_token = _refresh_oauth2_token(client_id, client_secret, refresh_token)
         if new_access_token:
             oauth2_token = new_access_token
-            # Optionally update the env var for this session
+            # Export to environment so Cline can capture it for future launches
             os.environ["X_OAUTH_ACCESS_TOKEN"] = new_access_token
-
-    if client_id and client_secret and oauth2_token:
-        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-            print("Using OAuth2 bearer token authentication")
-        LOGGER.info("Using OAuth2 bearer token authentication")
-        return {"Authorization": f"Bearer {oauth2_token}"}
+            print("=" * 60)
+            print("OAUTH2 TOKEN REFRESHED SUCCESSFULLY")
+            print("=" * 60)
+            print(f"New X_OAUTH_ACCESS_TOKEN: {new_access_token}")
+            print("")
+            print("To persist this token across VSCode restarts, add this to your")
+            print("Cline MCP settings (cline_mcp_settings.json) under the xmcp env:")
+            print(f'  "X_OAUTH_ACCESS_TOKEN": "{new_access_token}"')
+            print("=" * 60)
+            if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+                print("Using OAuth2 bearer token authentication")
+            LOGGER.info("Using OAuth2 bearer token authentication")
+            return {"Authorization": f"Bearer {oauth2_token}"}
+        else:
+            print(">>> OAUTH2 TOKEN REFRESH FAILED - FALLING BACK TO OAUTH1 <<<")
 
     # Fall back to OAuth1
     consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
@@ -353,6 +370,7 @@ def build_auth_client():
         }
 
     # Fall back to browser-based OAuth1 flow
+    print(">>> TRIGGERING OAUTH1 BROWSER FLOW <<<")
     access_token, access_secret = run_oauth1_flow()
     if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
         print("OAuth1 access token:", access_token)
@@ -375,6 +393,8 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
 
     token_url = "https://api.x.com/2/oauth2/token"
 
+    print(f">>> OAUTH2 REFRESH: POST to {token_url}")
+
     # Create Basic auth header with client credentials
     credentials = f"{client_id}:{client_secret}"
     encoded_credentials = base64.b64encode(credentials.encode()).decode()
@@ -390,7 +410,11 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
     }
 
     try:
+        print(">>> Sending refresh request...")
         response = requests.post(token_url, headers=headers, data=data, timeout=30)
+        print(f">>> Response status: {response.status_code}")
+        print(f">>> Response body: {response.text[:500]}")  # Print first 500 chars
+
         response.raise_for_status()
         token_data = response.json()
 
@@ -398,19 +422,22 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
         new_refresh_token = token_data.get("refresh_token")
 
         if new_access_token:
-            print("Successfully refreshed OAuth2 access token")
+            print(">>> Successfully refreshed OAuth2 access token")
             if new_refresh_token:
-                print("Received new refresh token (updating...)")
-                # Note: In production, you'd want to persist this
-                # For now, we'll just use it for this session
+                print(">>> Received new refresh token (rotation)")
             return new_access_token
         else:
-            print("Token refresh response did not contain access_token")
+            print(">>> Token refresh response did not contain access_token")
+            print(f">>> Full response: {token_data}")
             return None
 
     except requests.exceptions.RequestException as e:
-        print(f"Failed to refresh OAuth2 token: {e}")
+        print(f">>> Failed to refresh OAuth2 token: {e}")
         LOGGER.error("OAuth2 token refresh failed: %s", e)
+        return None
+    except Exception as e:
+        print(f">>> Unexpected error during refresh: {type(e).__name__}: {e}")
+        LOGGER.error("Unexpected error during OAuth2 refresh: %s", e)
         return None
 
 
