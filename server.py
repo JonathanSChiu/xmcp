@@ -1,4 +1,6 @@
+import base64
 import copy
+import hashlib
 import http.server
 import logging
 import os
@@ -30,8 +32,13 @@ LOGGER = logging.getLogger("xmcp.x_api")
 OAUTH_LOGGER = logging.getLogger("xmcp.oauth1")
 
 REQUEST_TOKEN_URL = "https://api.x.com/oauth/request_token"
-AUTHORIZE_URL = "https://api.x.com/oauth/authorize"
+AUTHORIZE_URL = "https://api.x.com/oauth/authorize"          # OAuth1
 ACCESS_TOKEN_URL = "https://api.x.com/oauth/access_token"
+
+# OAuth2 (Authorization Code + PKCE for user context)
+OAUTH2_AUTHORIZE_URL = "https://x.com/i/oauth2/authorize"
+OAUTH2_TOKEN_URL = "https://api.x.com/2/oauth2/token"
+OAUTH2_SCOPE = "tweet.read tweet.write users.read bookmark.read offline.access"
 
 
 def is_truthy(value: str | None) -> bool:
@@ -200,6 +207,178 @@ def run_oauth1_flow() -> tuple[str, str]:
     return access_key, access_secret
 
 
+def generate_pkce_pair() -> tuple[str, str]:
+    """
+    Generate a PKCE code verifier and code challenge (S256).
+    Returns (code_verifier, code_challenge).
+    """
+    code_verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return code_verifier, code_challenge
+
+
+def run_oauth2_pkce_flow() -> tuple[str, str | None]:
+    """
+    Perform the full interactive X API v2 OAuth2 Authorization Code + PKCE flow.
+
+    Opens a browser for the user to authorize, starts a local callback server,
+    exchanges the code for an access_token + refresh_token (with offline.access),
+    and returns them.
+
+    Uses OAUTH2_CALLBACK_* env vars for the redirect URI (must be registered
+    in your X Developer App).
+    """
+    client_id = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
+
+    if not client_id or not client_secret:
+        raise RuntimeError("CLIENT_ID and CLIENT_SECRET are required for the OAuth2 PKCE flow.")
+
+    callback_host = os.getenv("OAUTH2_CALLBACK_HOST", "127.0.0.1")
+    callback_port = _get_env_int("OAUTH2_CALLBACK_PORT", 9876)
+    callback_path = os.getenv("OAUTH2_CALLBACK_PATH", "/oauth/callback")
+    callback_timeout = _get_env_int("X_OAUTH_CALLBACK_TIMEOUT", 300)  # reuse existing timeout var or default 5 min
+
+    callback_url = _callback_url(callback_host, callback_port, callback_path)
+
+    print("=" * 70)
+    print("OAUTH2 PKCE AUTHORIZATION FLOW (interactive)")
+    print("=" * 70)
+    print(f"Callback URL: {callback_url}")
+    print("IMPORTANT: This URL must be registered exactly in your X Developer App")
+    print("under User authentication settings > Redirect URI.")
+    print("")
+
+    # PKCE + state
+    code_verifier, code_challenge = generate_pkce_pair()
+    state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode("ascii")
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": callback_url,
+        "scope": OAUTH2_SCOPE,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{OAUTH2_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+    print("Opening browser for X authorization consent...")
+    LOGGER.info("Opening OAuth2 authorization URL: %s", auth_url)
+    webbrowser.open(auth_url)
+
+    # --- Local callback server (similar pattern to OAuth1 flow) ---
+    captured: dict[str, str | None] = {"code": None, "state": None, "error": None}
+    event = threading.Event()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != callback_path:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not found.")
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            captured["code"] = (query.get("code") or [None])[0]
+            captured["state"] = (query.get("state") or [None])[0]
+            captured["error"] = (query.get("error") or [None])[0]
+            event.set()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                b"Authorization received. You may close this tab and return to the terminal."
+            )
+
+        def log_message(self, format: str, *args: object) -> None:
+            LOGGER.debug("OAuth2 callback: " + format, *args)
+
+    class _Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    server = _Server((callback_host, callback_port), _Handler)
+    server.timeout = 1
+    deadline = time.time() + callback_timeout
+
+    print(f"Waiting for authorization callback... (timeout: {callback_timeout}s)")
+    try:
+        while time.time() < deadline:
+            server.handle_request()
+            if event.is_set():
+                break
+    finally:
+        server.server_close()
+
+    if captured["error"]:
+        raise RuntimeError(f"Authorization denied by user: {captured['error']}")
+
+    auth_code = captured.get("code")
+    if not auth_code:
+        raise TimeoutError("No authorization code received (timed out or cancelled).")
+
+    if captured.get("state") != state:
+        raise RuntimeError("State mismatch — possible CSRF or callback tampering.")
+
+    print(">>> Authorization code received. Exchanging for tokens...")
+
+    # Token exchange — confidential client (Basic auth + code_verifier)
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+
+    token_headers = {
+        "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": callback_url,
+        "code_verifier": code_verifier,
+    }
+
+    response = requests.post(
+        OAUTH2_TOKEN_URL,
+        headers=token_headers,
+        data=token_data,
+        timeout=30,
+    )
+    print(f">>> Token endpoint response: {response.status_code}")
+
+    if not response.ok:
+        # Reuse the nice error formatting we added earlier
+        try:
+            err_json = response.json()
+            err_type = err_json.get("error", "unknown_error")
+            err_desc = err_json.get("error_description", response.text[:300])
+            print(f">>> X OAuth2 error: {err_type}")
+            if err_desc:
+                print(f">>>   Description: {err_desc}")
+        except Exception:
+            print(f">>> Response body: {response.text[:1000]}")
+        response.raise_for_status()
+
+    token_json = response.json()
+    access_token = token_json.get("access_token")
+    refresh_token = token_json.get("refresh_token")
+
+    if not access_token:
+        raise RuntimeError(f"No access_token in response: {token_json}")
+
+    print("")
+    print("=" * 60)
+    print("OAUTH2 TOKENS RECEIVED SUCCESSFULLY")
+    print(f"  access_token:  {access_token[:30]}...")
+    if refresh_token:
+        print(f"  refresh_token: {refresh_token[:30]}...")
+    print("  (These have been persisted to .env for future startups)")
+    print("=" * 60)
+
+    return access_token, refresh_token
+
+
 def load_env() -> None:
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
@@ -300,94 +479,31 @@ def get_auth_headers(oauth_token: str | None = None) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def build_auth_client():
+def _validate_oauth2_token(access_token: str) -> bool:
     """
-    Build authentication headers preferring OAuth2 over OAuth1.
-    Returns a dict of headers to use for API requests.
-    Automatically refreshes OAuth2 access tokens using the refresh token.
+    Probe the X API to check whether the current OAuth2 access token is valid.
+    Returns True if the token works, False otherwise.
     """
-    # Try OAuth2 first (preferred for persistent auth without browser)
-    client_id = os.getenv("CLIENT_ID", "").strip()
-    client_secret = os.getenv("CLIENT_SECRET", "").strip()
-    oauth2_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
-    refresh_token = os.getenv("X_OAUTH_REFRESH_TOKEN", "").strip()
-
-    # Diagnostic: Show which credentials are detected
-    print("=" * 60)
-    print("OAUTH2 CREDENTIALS DETECTION:")
-    print(f"  CLIENT_ID present: {bool(client_id)}")
-    print(f"  CLIENT_SECRET present: {bool(client_secret)}")
-    print(f"  X_OAUTH_REFRESH_TOKEN present: {bool(refresh_token)}")
-    print(f"  X_OAUTH_ACCESS_TOKEN present: {bool(oauth2_token)}")
-    print("=" * 60)
-
-    # If we have OAuth2 credentials and a refresh token, always try to refresh
-    # This ensures we get a fresh token on every startup
-    if client_id and client_secret and refresh_token:
-        print(">>> ATTEMPTING OAUTH2 TOKEN REFRESH <<<")
-        new_access_token = _refresh_oauth2_token(client_id, client_secret, refresh_token)
-        if new_access_token:
-            oauth2_token = new_access_token
-            # Export to environment so Cline can capture it for future launches
-            os.environ["X_OAUTH_ACCESS_TOKEN"] = new_access_token
-            print("=" * 60)
-            print("OAUTH2 TOKEN REFRESHED SUCCESSFULLY")
-            print("=" * 60)
-            print(f"New X_OAUTH_ACCESS_TOKEN: {new_access_token}")
-            print("")
-            print("To persist this token across VSCode restarts, add this to your")
-            print("Cline MCP settings (cline_mcp_settings.json) under the xmcp env:")
-            print(f'  "X_OAUTH_ACCESS_TOKEN": "{new_access_token}"')
-            print("=" * 60)
-            if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-                print("Using OAuth2 bearer token authentication")
-            LOGGER.info("Using OAuth2 bearer token authentication")
-            return {"Authorization": f"Bearer {oauth2_token}"}
+    probe_url = "https://api.x.com/2/users/me"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    print(">>> Validating existing OAuth2 access token...")
+    try:
+        response = requests.get(probe_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            print(">>> Existing OAuth2 token is valid.")
+            return True
         else:
-            print(">>> OAUTH2 TOKEN REFRESH FAILED - FALLING BACK TO OAUTH1 <<<")
-
-    # Fall back to OAuth1
-    consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
-    consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET")
-    if not consumer_key or not consumer_secret:
-        raise RuntimeError(
-            "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
-        )
-
-    # Check for pre-existing OAuth1 tokens first (for stdio mode / Cline integration)
-    env_access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
-    env_access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
-
-    if env_access_token and env_access_secret:
-        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-            print("Using pre-existing OAuth1 access token:", env_access_token)
-        LOGGER.info("Using pre-existing OAuth1 access token: %s", env_access_token)
-        return {
-            "client_key": consumer_key,
-            "client_secret": consumer_secret,
-            "resource_owner_key": env_access_token,
-            "resource_owner_secret": env_access_secret,
-        }
-
-    # Fall back to browser-based OAuth1 flow
-    print(">>> TRIGGERING OAUTH1 BROWSER FLOW <<<")
-    access_token, access_secret = run_oauth1_flow()
-    if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-        print("OAuth1 access token:", access_token)
-        print("OAuth1 access token secret:", access_secret)
-    LOGGER.info("OAuth1 access token: %s", access_token)
-    return {
-        "client_key": consumer_key,
-        "client_secret": consumer_secret,
-        "resource_owner_key": access_token,
-        "resource_owner_secret": access_secret,
-    }
+            print(f">>> OAuth2 token probe returned {response.status_code} — token is expired or invalid.")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f">>> OAuth2 token validation probe failed: {e}")
+        return False
 
 
-def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str) -> str | None:
+def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str) -> tuple[str, str] | None:
     """
     Refresh an OAuth2 access token using the refresh token.
-    Returns the new access token, or None if refresh failed.
+    Returns a tuple of (new_access_token, new_refresh_token), or None if refresh failed.
     """
     import base64
 
@@ -413,7 +529,25 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
         print(">>> Sending refresh request...")
         response = requests.post(token_url, headers=headers, data=data, timeout=30)
         print(f">>> Response status: {response.status_code}")
-        print(f">>> Response body: {response.text[:500]}")  # Print first 500 chars
+
+        if response.status_code >= 400:
+            # X returns structured errors — surface them clearly instead of raw body (avoids noise + helps user)
+            try:
+                err_json = response.json()
+                err_type = err_json.get("error", "unknown_error")
+                err_desc = err_json.get("error_description", "")
+                print(f">>> X OAuth2 error: {err_type}")
+                if err_desc:
+                    print(f">>>   Description: {err_desc}")
+                # Common actionable cases
+                if err_type in ("invalid_grant", "invalid_request"):
+                    print(">>>   → This usually means your refresh_token is invalid, expired, or revoked.")
+                    print(">>>   → Since CLIENT_ID + CLIENT_SECRET are configured, the server will now")
+                    print(">>>      automatically start the interactive OAuth2 PKCE flow to get fresh tokens.")
+            except Exception:
+                print(f">>> Response body: {response.text[:500]}")
+        else:
+            print(">>> Response body: (success; tokens redacted for security)")
 
         response.raise_for_status()
         token_data = response.json()
@@ -425,7 +559,7 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
             print(">>> Successfully refreshed OAuth2 access token")
             if new_refresh_token:
                 print(">>> Received new refresh token (rotation)")
-            return new_access_token
+            return new_access_token, new_refresh_token
         else:
             print(">>> Token refresh response did not contain access_token")
             print(f">>> Full response: {token_data}")
@@ -433,12 +567,41 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
 
     except requests.exceptions.RequestException as e:
         print(f">>> Failed to refresh OAuth2 token: {e}")
-        LOGGER.error("OAuth2 token refresh failed: %s", e)
+        # This is recoverable when CLIENT_ID + CLIENT_SECRET are present (we will launch
+        # the interactive PKCE flow next). Downgrade from ERROR to avoid scary logs
+        # in MCP clients every time a refresh token has expired.
+        LOGGER.warning("OAuth2 token refresh failed (will attempt interactive re-auth if client credentials are configured): %s", e)
         return None
     except Exception as e:
         print(f">>> Unexpected error during refresh: {type(e).__name__}: {e}")
         LOGGER.error("Unexpected error during OAuth2 refresh: %s", e)
         return None
+
+
+def _persist_tokens_to_env(access_token: str, refresh_token: str | None) -> None:
+    """
+    Write the OAuth2 tokens into the .env file so they survive server restarts.
+    Uses python-dotenv's set_key to update the file in-place.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        print(f">>> .env file not found at {env_path}, creating one.")
+        env_path.write_text("")
+
+    try:
+        from dotenv import set_key
+    except ImportError:
+        print(">>> dotenv.set_key not available; cannot persist tokens automatically.")
+        print(f">>> Set X_OAUTH_ACCESS_TOKEN={access_token} manually in your .env")
+        return
+
+    print(">>> Persisting OAuth2 tokens to .env ...")
+    set_key(str(env_path), "X_OAUTH_ACCESS_TOKEN", access_token)
+    if refresh_token:
+        set_key(str(env_path), "X_OAUTH_REFRESH_TOKEN", refresh_token)
+        print(">>> Persisted new X_OAUTH_ACCESS_TOKEN and X_OAUTH_REFRESH_TOKEN to .env")
+    else:
+        print(">>> Persisted new X_OAUTH_ACCESS_TOKEN to .env (no refresh token rotation)")
 
 
 def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> None:
@@ -453,6 +616,132 @@ def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> Non
         print("OAuth1 Authorization header (sample GET /2/users/me):", auth_header)
     else:
         print("OAuth1 Authorization header missing from signed probe request.")
+
+
+def build_auth_client():
+    """
+    Build authentication headers preferring OAuth2 over OAuth1.
+
+    New automatic OAuth2 flow (when CLIENT_ID + CLIENT_SECRET are configured):
+    1. If we have an existing X_OAUTH_ACCESS_TOKEN, probe /2/users/me to validate it.
+    2. If valid → use it immediately (no browser, no refresh).
+    3. If invalid/missing + we have a refresh_token → attempt refresh + auto-persist to .env.
+    4. If no usable token/refresh but CLIENT_ID + CLIENT_SECRET exist → automatically
+       run the full interactive OAuth2 Authorization Code + PKCE flow (browser popup,
+       local callback server, token exchange). On success the new tokens are persisted
+       to .env so future starts are automatic.
+    5. Only if no CLIENT_ID/CLIENT_SECRET at all do we fall back to the legacy OAuth1 paths.
+
+    If the interactive OAuth2 flow is started but fails/cancelled/times out, the server
+    raises a clear error (no silent OAuth1 fallback when modern OAuth2 creds are present).
+
+    Returns a dict of headers to use for API requests.
+    """
+    # Try OAuth2 first (preferred for persistent auth without browser)
+    client_id = os.getenv("CLIENT_ID", "").strip()
+    client_secret = os.getenv("CLIENT_SECRET", "").strip()
+    oauth2_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    refresh_token = os.getenv("X_OAUTH_REFRESH_TOKEN", "").strip()
+
+    # Diagnostic: Show which credentials are detected
+    print("=" * 60)
+    print("OAUTH2 CREDENTIALS DETECTION:")
+    print(f"  CLIENT_ID present: {bool(client_id)} (len={len(client_id)})")
+    print(f"  CLIENT_SECRET present: {bool(client_secret)} (len={len(client_secret)})")
+    print(f"  X_OAUTH_REFRESH_TOKEN present: {bool(refresh_token)} (len={len(refresh_token)})")
+    print(f"  X_OAUTH_ACCESS_TOKEN present: {bool(oauth2_token)} (len={len(oauth2_token)})")
+    print("=" * 60)
+
+    # --- Step 1: If we already have an access token, validate it first ---
+    if oauth2_token:
+        if _validate_oauth2_token(oauth2_token):
+            print(">>> Using existing OAuth2 access token (valid).")
+            LOGGER.info("Using existing OAuth2 bearer token authentication")
+            return {"Authorization": f"Bearer {oauth2_token}"}
+        else:
+            print(">>> Existing OAuth2 token is invalid — will try to refresh.")
+
+    # --- Step 2: Attempt token refresh if we have the credentials ---
+    if client_id and client_secret and refresh_token:
+        print(">>> ATTEMPTING OAUTH2 TOKEN REFRESH <<<")
+        result = _refresh_oauth2_token(client_id, client_secret, refresh_token)
+        if result:
+            new_access_token, new_refresh_token = result
+            # Export to environment so the current process can use it
+            os.environ["X_OAUTH_ACCESS_TOKEN"] = new_access_token
+            # Persist to .env so future startups skip the refresh
+            _persist_tokens_to_env(new_access_token, new_refresh_token)
+            print("=" * 60)
+            print("OAUTH2 TOKEN REFRESHED SUCCESSFULLY")
+            print("=" * 60)
+            LOGGER.info("Using OAuth2 bearer token authentication")
+            return {"Authorization": f"Bearer {new_access_token}"}
+        else:
+            print(">>> OAUTH2 TOKEN REFRESH FAILED — will attempt automatic re-authorization via PKCE")
+
+    # --- Step 3: If we have CLIENT_ID + CLIENT_SECRET, run the full interactive OAuth2 PKCE flow ---
+    # This is now the automatic way to obtain a fresh OAuth2 user token on startup.
+    if client_id and client_secret:
+        print(">>> NO VALID OAUTH2 TOKEN/REFRESH — STARTING AUTOMATIC OAUTH2 PKCE FLOW <<<")
+        print(">>> If the browser shows 'something went wrong', the #1 cause is that the")
+        print(">>> Callback URL printed below is NOT registered exactly in your X app.")
+        try:
+            access_token, refresh_token = run_oauth2_pkce_flow()
+            os.environ["X_OAUTH_ACCESS_TOKEN"] = access_token
+            if refresh_token:
+                os.environ["X_OAUTH_REFRESH_TOKEN"] = refresh_token
+            _persist_tokens_to_env(access_token, refresh_token)
+            LOGGER.info("Using freshly obtained OAuth2 bearer token authentication")
+            return {"Authorization": f"Bearer {access_token}"}
+        except Exception as flow_err:
+            print(f">>> OAuth2 PKCE authorization flow failed: {flow_err}")
+            raise RuntimeError(
+                "OAuth2 authorization is required (CLIENT_ID/CLIENT_SECRET provided) "
+                "but the interactive browser flow did not complete successfully.\n\n"
+                "Most common cause: The 'Callback URL' shown above does not exactly match\n"
+                "a Redirect URI registered in your X Developer App (User authentication settings).\n"
+                "X is extremely strict — it must match character-for-character (use 127.0.0.1, not localhost).\n\n"
+                "Other causes: user cancelled/denied, timeout, or network error.\n"
+                "After fixing the redirect URI registration, run the server again."
+            ) from flow_err
+
+    # --- Step 4: Pure OAuth1 path (no CLIENT_ID/CLIENT_SECRET configured at all) ---
+    consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY")
+    consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET")
+    if not consumer_key or not consumer_secret:
+        raise RuntimeError(
+            "No usable OAuth2 credentials (CLIENT_ID/CLIENT_SECRET + token or refresh) and "
+            "no X_OAUTH_CONSUMER_KEY / X_OAUTH_CONSUMER_SECRET provided for OAuth1 fallback."
+        )
+
+    # Check for pre-existing OAuth1 tokens first (for stdio mode / Cline integration)
+    env_access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    env_access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
+
+    if env_access_token and env_access_secret:
+        if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+            print("Using pre-existing OAuth1 access token:", env_access_token)
+        LOGGER.info("Using pre-existing OAuth1 access token: %s", env_access_token)
+        return {
+            "client_key": consumer_key,
+            "client_secret": consumer_secret,
+            "resource_owner_key": env_access_token,
+            "resource_owner_secret": env_access_secret,
+        }
+
+    # Fall back to browser-based OAuth1 flow (legacy path)
+    print(">>> TRIGGERING OAUTH1 BROWSER FLOW <<<")
+    access_token, access_secret = run_oauth1_flow()
+    if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
+        print("OAuth1 access token:", access_token)
+        print("OAuth1 access token secret:", access_secret)
+    LOGGER.info("OAuth1 access token: %s", access_token)
+    return {
+        "client_key": consumer_key,
+        "client_secret": consumer_secret,
+        "resource_owner_key": access_token,
+        "resource_owner_secret": access_secret,
+    }
 
 
 def create_mcp() -> FastMCP:
@@ -471,40 +760,13 @@ def create_mcp() -> FastMCP:
     # Determine if we're using OAuth2 or OAuth1
     is_oauth2 = isinstance(auth_config, dict) and "Authorization" in auth_config and auth_config.get("Authorization", "").startswith("Bearer ")
 
-    if is_oauth2:
-        # OAuth2: use bearer token directly
-        oauth2_token = auth_config["Authorization"].replace("Bearer ", "")
-        client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={"Authorization": f"Bearer {oauth2_token}"},
-            timeout=timeout,
-            event_hooks={
-                "request": [normalize_query_params, log_request],
-                "response": [log_response],
-            },
-        )
-        return FastMCP.from_openapi(
-            openapi_spec=filtered_spec,
-            client=client,
-            name="X API MCP",
-        )
-    else:
-        # OAuth1: build OAuth1Client from the returned config
-        oauth1_client = OAuth1Client(
-            client_key=auth_config["client_key"],
-            client_secret=auth_config["client_secret"],
-            resource_owner_key=auth_config["resource_owner_key"],
-            resource_owner_secret=auth_config["resource_owner_secret"],
-            signature_type="AUTH_HEADER",
-        )
-        if print_oauth_header:
-            print_oauth1_header_probe(oauth1_client, base_url)
-
+    # Load the OpenAPI spec before branching (needed by both paths)
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
     comma_params = collect_comma_params(filtered_spec)
     print_tool_list(filtered_spec)
 
+    # Define request/response hooks used by both paths
     async def normalize_query_params(request: httpx.Request) -> None:
         if not comma_params:
             return
@@ -536,31 +798,6 @@ def create_mcp() -> FastMCP:
 
         request.url = request.url.copy_with(params=normalized)
 
-    b3_flags = os.getenv("X_B3_FLAGS", "1")
-
-    async def sign_oauth1_request(request: httpx.Request) -> None:
-        request.headers["X-B3-Flags"] = b3_flags
-        headers = dict(request.headers)
-        content_type = headers.get("Content-Type", "")
-        body: str | None = None
-        if content_type.startswith("application/x-www-form-urlencoded"):
-            body_bytes = request.content or b""
-            body = body_bytes.decode("utf-8")
-        signed_url, signed_headers, _ = oauth1_client.sign(
-            str(request.url),
-            http_method=request.method,
-            body=body,
-            headers=headers,
-        )
-        request.url = httpx.URL(signed_url)
-        request.headers.update(signed_headers)
-        if print_oauth_header:
-            auth_header = signed_headers.get("Authorization")
-            if auth_header:
-                print("OAuth1 Authorization header:", auth_header)
-            else:
-                print("OAuth1 Authorization header missing from signed request.")
-
     async def log_request(request: httpx.Request) -> None:
         if not debug_enabled:
             return
@@ -585,21 +822,74 @@ def create_mcp() -> FastMCP:
                 text = text[:1000] + "...<truncated>"
             LOGGER.warning("X API error body: %s", text)
 
-    client = httpx.AsyncClient(
-        base_url=base_url,
-        headers={},
-        timeout=timeout,
-        event_hooks={
-            "request": [normalize_query_params, sign_oauth1_request, log_request],
-            "response": [log_response],
-        },
-    )
-    return FastMCP.from_openapi(
-        openapi_spec=filtered_spec,
-        client=client,
-        name="X API MCP",
-    )
+    if is_oauth2:
+        # OAuth2: use bearer token directly (no signature hook needed)
+        oauth2_token = auth_config["Authorization"].replace("Bearer ", "")
+        client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {oauth2_token}"},
+            timeout=timeout,
+            event_hooks={
+                "request": [normalize_query_params, log_request],
+                "response": [log_response],
+            },
+        )
+        return FastMCP.from_openapi(
+            openapi_spec=filtered_spec,
+            client=client,
+            name="X API MCP",
+        )
+    else:
+        # OAuth1: build OAuth1Client from the returned config
+        oauth1_client = OAuth1Client(
+            client_key=auth_config["client_key"],
+            client_secret=auth_config["client_secret"],
+            resource_owner_key=auth_config["resource_owner_key"],
+            resource_owner_secret=auth_config["resource_owner_secret"],
+            signature_type="AUTH_HEADER",
+        )
+        if print_oauth_header:
+            print_oauth1_header_probe(oauth1_client, base_url)
 
+        b3_flags = os.getenv("X_B3_FLAGS", "1")
+
+        async def sign_oauth1_request(request: httpx.Request) -> None:
+            request.headers["X-B3-Flags"] = b3_flags
+            headers = dict(request.headers)
+            content_type = headers.get("Content-Type", "")
+            body: str | None = None
+            if content_type.startswith("application/x-www-form-urlencoded"):
+                body_bytes = request.content or b""
+                body = body_bytes.decode("utf-8")
+            signed_url, signed_headers, _ = oauth1_client.sign(
+                str(request.url),
+                http_method=request.method,
+                body=body,
+                headers=headers,
+            )
+            request.url = httpx.URL(signed_url)
+            request.headers.update(signed_headers)
+            if print_oauth_header:
+                auth_header = signed_headers.get("Authorization")
+                if auth_header:
+                    print("OAuth1 Authorization header:", auth_header)
+                else:
+                    print("OAuth1 Authorization header missing from signed request.")
+
+        client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={},
+            timeout=timeout,
+            event_hooks={
+                "request": [normalize_query_params, sign_oauth1_request, log_request],
+                "response": [log_response],
+            },
+        )
+        return FastMCP.from_openapi(
+            openapi_spec=filtered_spec,
+            client=client,
+            name="X API MCP",
+        )
 
 
 

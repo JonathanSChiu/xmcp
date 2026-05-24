@@ -38,11 +38,13 @@ FastMCP. Streaming and webhook endpoints are excluded.
      - `XAI_API_KEY`
      - `XAI_MODEL` (default `grok-4-1-fast`)
      - `MCP_SERVER_URL` (default `http://127.0.0.1:8000/mcp`)
-   - Optional OAuth2 token generation:
+   - Optional OAuth2 token generation (now preferred + automatic):
      - `CLIENT_ID`
      - `CLIENT_SECRET`
      - `X_OAUTH_ACCESS_TOKEN`
-    - `X_OAUTH_ACCESS_TOKEN_SECRET` (optional)
+     - `X_OAUTH_REFRESH_TOKEN`
+     - `OAUTH2_CALLBACK_HOST` / `PORT` / `PATH` (default 127.0.0.1:9876/oauth/callback — must be registered in your X app)
+     - `X_OAUTH_ACCESS_TOKEN_SECRET` (only needed for legacy OAuth1)
    - Optional OAuth1 debug output:
      - `X_OAUTH_PRINT_TOKENS`
      - `X_OAUTH_PRINT_AUTH_HEADER`
