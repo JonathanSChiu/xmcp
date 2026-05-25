@@ -5,6 +5,7 @@ import http.server
 import logging
 import os
 import socketserver
+import sys
 import threading
 import time
 import urllib.parse
@@ -242,13 +243,13 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
 
     callback_url = _callback_url(callback_host, callback_port, callback_path)
 
-    print("=" * 70)
-    print("OAUTH2 PKCE AUTHORIZATION FLOW (interactive)")
-    print("=" * 70)
-    print(f"Callback URL: {callback_url}")
-    print("IMPORTANT: This URL must be registered exactly in your X Developer App")
-    print("under User authentication settings > Redirect URI.")
-    print("")
+    LOGGER.info("=" * 70)
+    LOGGER.info("OAUTH2 PKCE AUTHORIZATION FLOW (interactive)")
+    LOGGER.info("=" * 70)
+    LOGGER.info("Callback URL: %s", callback_url)
+    LOGGER.info("IMPORTANT: This URL must be registered exactly in your X Developer App")
+    LOGGER.info("under User authentication settings > Redirect URI.")
+    LOGGER.info("")
 
     # PKCE + state
     code_verifier, code_challenge = generate_pkce_pair()
@@ -265,7 +266,7 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
     }
     auth_url = f"{OAUTH2_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
-    print("Opening browser for X authorization consent...")
+    LOGGER.info("Opening browser for X authorization consent...")
     LOGGER.info("Opening OAuth2 authorization URL: %s", auth_url)
     webbrowser.open(auth_url)
 
@@ -302,7 +303,7 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
     server.timeout = 1
     deadline = time.time() + callback_timeout
 
-    print(f"Waiting for authorization callback... (timeout: {callback_timeout}s)")
+    LOGGER.info("Waiting for authorization callback... (timeout: %ss)", callback_timeout)
     try:
         while time.time() < deadline:
             server.handle_request()
@@ -321,7 +322,7 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
     if captured.get("state") != state:
         raise RuntimeError("State mismatch — possible CSRF or callback tampering.")
 
-    print(">>> Authorization code received. Exchanging for tokens...")
+    LOGGER.info(">>> Authorization code received. Exchanging for tokens...")
 
     # Token exchange — confidential client (Basic auth + code_verifier)
     credentials = f"{client_id}:{client_secret}"
@@ -345,7 +346,7 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
         data=token_data,
         timeout=30,
     )
-    print(f">>> Token endpoint response: {response.status_code}")
+    LOGGER.info(">>> Token endpoint response: %s", response.status_code)
 
     if not response.ok:
         # Reuse the nice error formatting we added earlier
@@ -353,11 +354,11 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
             err_json = response.json()
             err_type = err_json.get("error", "unknown_error")
             err_desc = err_json.get("error_description", response.text[:300])
-            print(f">>> X OAuth2 error: {err_type}")
+            LOGGER.error(">>> X OAuth2 error: %s", err_type)
             if err_desc:
-                print(f">>>   Description: {err_desc}")
+                LOGGER.error(">>>   Description: %s", err_desc)
         except Exception:
-            print(f">>> Response body: {response.text[:1000]}")
+            LOGGER.error(">>> Response body: %s", response.text[:1000])
         response.raise_for_status()
 
     token_json = response.json()
@@ -367,14 +368,14 @@ def run_oauth2_pkce_flow() -> tuple[str, str | None]:
     if not access_token:
         raise RuntimeError(f"No access_token in response: {token_json}")
 
-    print("")
-    print("=" * 60)
-    print("OAUTH2 TOKENS RECEIVED SUCCESSFULLY")
-    print(f"  access_token:  {access_token[:30]}...")
+    LOGGER.info("")
+    LOGGER.info("=" * 60)
+    LOGGER.info("OAUTH2 TOKENS RECEIVED SUCCESSFULLY")
+    LOGGER.info("  access_token:  %s...", access_token[:30])
     if refresh_token:
-        print(f"  refresh_token: {refresh_token[:30]}...")
-    print("  (These have been persisted to .env for future startups)")
-    print("=" * 60)
+        LOGGER.info("  refresh_token: %s...", refresh_token[:30])
+    LOGGER.info("  (These have been persisted to .env for future startups)")
+    LOGGER.info("=" * 60)
 
     return access_token, refresh_token
 
@@ -391,11 +392,62 @@ def load_env() -> None:
 
 
 def setup_logging() -> bool:
+    """
+    Configure logging to both stderr and server.log.
+
+    - server.log is always cleared on server startup (fresh logs per run).
+    - All output goes to stderr (correct for stdio MCP) + the log file.
+    - The log file is gitignored.
+    """
     debug_enabled = is_truthy(os.getenv("X_API_DEBUG", "1"))
-    if debug_enabled:
-        logging.basicConfig(level=logging.INFO)
-        LOGGER.setLevel(logging.INFO)
+    level = logging.DEBUG if debug_enabled else logging.INFO
+
+    log_path = Path(__file__).resolve().parent / "server.log"
+
+    # Clear the log file on every server start
+    try:
+        log_path.write_text("", encoding="utf-8")
+    except Exception:
+        # Non-fatal if we can't write the log file
+        pass
+
+    handlers = []
+
+    # stderr handler (visible when running manually + captured by some hosts)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(level)
+    stderr_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+    handlers.append(stderr_handler)
+
+    # File handler - always append after we cleared the file above
+    try:
+        file_handler = logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        handlers.append(file_handler)
+    except Exception as e:
+        # If file logging fails, we still have stderr
+        print(f"[xmcp] Warning: Could not open server.log for writing: {e}", file=sys.stderr)
+
+    # Apply configuration (force=True to override any previous config)
+    logging.basicConfig(
+        level=level,
+        handlers=handlers,
+        force=True,
+    )
+
+    # Ensure our loggers respect the level
+    LOGGER.setLevel(level)
+    OAUTH_LOGGER.setLevel(level)
+    logging.getLogger("xmcp.oauth2").setLevel(level)
+
+    LOGGER.info("Logging initialized → %s (cleared on every startup) + stderr", log_path)
     return debug_enabled
+
 
 
 def should_exclude_operation(path: str, operation: dict) -> bool:
@@ -465,9 +517,9 @@ def print_tool_list(spec: dict) -> None:
                 tools.append(f"{method.upper()} {path}")
 
     tools.sort()
-    print(f"Loaded {len(tools)} tools from OpenAPI:")
+    LOGGER.info("Loaded %s tools from OpenAPI:", len(tools))
     for tool in tools:
-        print(f"- {tool}")
+        LOGGER.info("- %s", tool)
 
 
 def get_auth_headers(oauth_token: str | None = None) -> dict:
@@ -486,17 +538,17 @@ def _validate_oauth2_token(access_token: str) -> bool:
     """
     probe_url = "https://api.x.com/2/users/me"
     headers = {"Authorization": f"Bearer {access_token}"}
-    print(">>> Validating existing OAuth2 access token...")
+    LOGGER.info(">>> Validating existing OAuth2 access token...")
     try:
         response = requests.get(probe_url, headers=headers, timeout=10)
         if response.status_code == 200:
-            print(">>> Existing OAuth2 token is valid.")
+            LOGGER.info(">>> Existing OAuth2 token is valid.")
             return True
         else:
-            print(f">>> OAuth2 token probe returned {response.status_code} — token is expired or invalid.")
+            LOGGER.info(">>> OAuth2 token probe returned %s — token is expired or invalid.", response.status_code)
             return False
     except requests.exceptions.RequestException as e:
-        print(f">>> OAuth2 token validation probe failed: {e}")
+        LOGGER.warning(">>> OAuth2 token validation probe failed: %s", e)
         return False
 
 
@@ -509,7 +561,7 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
 
     token_url = "https://api.x.com/2/oauth2/token"
 
-    print(f">>> OAUTH2 REFRESH: POST to {token_url}")
+    LOGGER.info(">>> OAUTH2 REFRESH: POST to %s", token_url)
 
     # Create Basic auth header with client credentials
     credentials = f"{client_id}:{client_secret}"
@@ -526,9 +578,9 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
     }
 
     try:
-        print(">>> Sending refresh request...")
+        LOGGER.info(">>> Sending refresh request...")
         response = requests.post(token_url, headers=headers, data=data, timeout=30)
-        print(f">>> Response status: {response.status_code}")
+        LOGGER.info(">>> Response status: %s", response.status_code)
 
         if response.status_code >= 400:
             # X returns structured errors — surface them clearly instead of raw body (avoids noise + helps user)
@@ -536,18 +588,18 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
                 err_json = response.json()
                 err_type = err_json.get("error", "unknown_error")
                 err_desc = err_json.get("error_description", "")
-                print(f">>> X OAuth2 error: {err_type}")
+                LOGGER.error(">>> X OAuth2 error: %s", err_type)
                 if err_desc:
-                    print(f">>>   Description: {err_desc}")
+                    LOGGER.error(">>>   Description: %s", err_desc)
                 # Common actionable cases
                 if err_type in ("invalid_grant", "invalid_request"):
-                    print(">>>   → This usually means your refresh_token is invalid, expired, or revoked.")
-                    print(">>>   → Since CLIENT_ID + CLIENT_SECRET are configured, the server will now")
-                    print(">>>      automatically start the interactive OAuth2 PKCE flow to get fresh tokens.")
+                    LOGGER.info(">>>   → This usually means your refresh_token is invalid, expired, or revoked.")
+                    LOGGER.info(">>>   → Since CLIENT_ID + CLIENT_SECRET are configured, the server will now")
+                    LOGGER.info(">>>      automatically start the interactive OAuth2 PKCE flow to get fresh tokens.")
             except Exception:
-                print(f">>> Response body: {response.text[:500]}")
+                LOGGER.error(">>> Response body: %s", response.text[:500])
         else:
-            print(">>> Response body: (success; tokens redacted for security)")
+            LOGGER.info(">>> Response body: (success; tokens redacted for security)")
 
         response.raise_for_status()
         token_data = response.json()
@@ -556,24 +608,21 @@ def _refresh_oauth2_token(client_id: str, client_secret: str, refresh_token: str
         new_refresh_token = token_data.get("refresh_token")
 
         if new_access_token:
-            print(">>> Successfully refreshed OAuth2 access token")
+            LOGGER.info(">>> Successfully refreshed OAuth2 access token")
             if new_refresh_token:
-                print(">>> Received new refresh token (rotation)")
+                LOGGER.info(">>> Received new refresh token (rotation)")
             return new_access_token, new_refresh_token
         else:
-            print(">>> Token refresh response did not contain access_token")
-            print(f">>> Full response: {token_data}")
+            LOGGER.info(">>> Token refresh response did not contain access_token")
+            LOGGER.info(">>> Full response: %s", token_data)
             return None
 
     except requests.exceptions.RequestException as e:
-        print(f">>> Failed to refresh OAuth2 token: {e}")
         # This is recoverable when CLIENT_ID + CLIENT_SECRET are present (we will launch
-        # the interactive PKCE flow next). Downgrade from ERROR to avoid scary logs
-        # in MCP clients every time a refresh token has expired.
+        # the interactive PKCE flow next). Use warning level.
         LOGGER.warning("OAuth2 token refresh failed (will attempt interactive re-auth if client credentials are configured): %s", e)
         return None
     except Exception as e:
-        print(f">>> Unexpected error during refresh: {type(e).__name__}: {e}")
         LOGGER.error("Unexpected error during OAuth2 refresh: %s", e)
         return None
 
@@ -585,23 +634,23 @@ def _persist_tokens_to_env(access_token: str, refresh_token: str | None) -> None
     """
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
-        print(f">>> .env file not found at {env_path}, creating one.")
+        LOGGER.info(">>> .env file not found at %s, creating one.", env_path)
         env_path.write_text("")
 
     try:
         from dotenv import set_key
     except ImportError:
-        print(">>> dotenv.set_key not available; cannot persist tokens automatically.")
-        print(f">>> Set X_OAUTH_ACCESS_TOKEN={access_token} manually in your .env")
+        LOGGER.warning(">>> dotenv.set_key not available; cannot persist tokens automatically.")
+        LOGGER.warning(">>> Set X_OAUTH_ACCESS_TOKEN=%s manually in your .env", access_token)
         return
 
-    print(">>> Persisting OAuth2 tokens to .env ...")
+    LOGGER.info(">>> Persisting OAuth2 tokens to .env ...")
     set_key(str(env_path), "X_OAUTH_ACCESS_TOKEN", access_token)
     if refresh_token:
         set_key(str(env_path), "X_OAUTH_REFRESH_TOKEN", refresh_token)
-        print(">>> Persisted new X_OAUTH_ACCESS_TOKEN and X_OAUTH_REFRESH_TOKEN to .env")
+        LOGGER.info(">>> Persisted new X_OAUTH_ACCESS_TOKEN and X_OAUTH_REFRESH_TOKEN to .env")
     else:
-        print(">>> Persisted new X_OAUTH_ACCESS_TOKEN to .env (no refresh token rotation)")
+        LOGGER.info(">>> Persisted new X_OAUTH_ACCESS_TOKEN to .env (no refresh token rotation)")
 
 
 def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> None:
@@ -613,9 +662,9 @@ def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> Non
     )
     auth_header = signed_headers.get("Authorization")
     if auth_header:
-        print("OAuth1 Authorization header (sample GET /2/users/me):", auth_header)
+        LOGGER.debug("OAuth1 Authorization header (sample GET /2/users/me): %s", auth_header)
     else:
-        print("OAuth1 Authorization header missing from signed probe request.")
+        LOGGER.debug("OAuth1 Authorization header missing from signed probe request.")
 
 
 def build_auth_client():
@@ -643,27 +692,27 @@ def build_auth_client():
     oauth2_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
     refresh_token = os.getenv("X_OAUTH_REFRESH_TOKEN", "").strip()
 
-    # Diagnostic: Show which credentials are detected
-    print("=" * 60)
-    print("OAUTH2 CREDENTIALS DETECTION:")
-    print(f"  CLIENT_ID present: {bool(client_id)} (len={len(client_id)})")
-    print(f"  CLIENT_SECRET present: {bool(client_secret)} (len={len(client_secret)})")
-    print(f"  X_OAUTH_REFRESH_TOKEN present: {bool(refresh_token)} (len={len(refresh_token)})")
-    print(f"  X_OAUTH_ACCESS_TOKEN present: {bool(oauth2_token)} (len={len(oauth2_token)})")
-    print("=" * 60)
+    # Diagnostic: Show which credentials are detected (goes to stderr via logger)
+    LOGGER.info("=" * 60)
+    LOGGER.info("OAUTH2 CREDENTIALS DETECTION:")
+    LOGGER.info(f"  CLIENT_ID present: {bool(client_id)} (len={len(client_id)})")
+    LOGGER.info(f"  CLIENT_SECRET present: {bool(client_secret)} (len={len(client_secret)})")
+    LOGGER.info(f"  X_OAUTH_REFRESH_TOKEN present: {bool(refresh_token)} (len={len(refresh_token)})")
+    LOGGER.info(f"  X_OAUTH_ACCESS_TOKEN present: {bool(oauth2_token)} (len={len(oauth2_token)})")
+    LOGGER.info("=" * 60)
 
     # --- Step 1: If we already have an access token, validate it first ---
     if oauth2_token:
         if _validate_oauth2_token(oauth2_token):
-            print(">>> Using existing OAuth2 access token (valid).")
+            LOGGER.info(">>> Using existing OAuth2 access token (valid).")
             LOGGER.info("Using existing OAuth2 bearer token authentication")
             return {"Authorization": f"Bearer {oauth2_token}"}
         else:
-            print(">>> Existing OAuth2 token is invalid — will try to refresh.")
+            LOGGER.info(">>> Existing OAuth2 token is invalid — will try to refresh.")
 
     # --- Step 2: Attempt token refresh if we have the credentials ---
     if client_id and client_secret and refresh_token:
-        print(">>> ATTEMPTING OAUTH2 TOKEN REFRESH <<<")
+        LOGGER.info(">>> ATTEMPTING OAUTH2 TOKEN REFRESH <<<")
         result = _refresh_oauth2_token(client_id, client_secret, refresh_token)
         if result:
             new_access_token, new_refresh_token = result
@@ -671,20 +720,20 @@ def build_auth_client():
             os.environ["X_OAUTH_ACCESS_TOKEN"] = new_access_token
             # Persist to .env so future startups skip the refresh
             _persist_tokens_to_env(new_access_token, new_refresh_token)
-            print("=" * 60)
-            print("OAUTH2 TOKEN REFRESHED SUCCESSFULLY")
-            print("=" * 60)
+            LOGGER.info("=" * 60)
+            LOGGER.info("OAUTH2 TOKEN REFRESHED SUCCESSFULLY")
+            LOGGER.info("=" * 60)
             LOGGER.info("Using OAuth2 bearer token authentication")
             return {"Authorization": f"Bearer {new_access_token}"}
         else:
-            print(">>> OAUTH2 TOKEN REFRESH FAILED — will attempt automatic re-authorization via PKCE")
+            LOGGER.info(">>> OAUTH2 TOKEN REFRESH FAILED — will attempt automatic re-authorization via PKCE")
 
     # --- Step 3: If we have CLIENT_ID + CLIENT_SECRET, run the full interactive OAuth2 PKCE flow ---
     # This is now the automatic way to obtain a fresh OAuth2 user token on startup.
     if client_id and client_secret:
-        print(">>> NO VALID OAUTH2 TOKEN/REFRESH — STARTING AUTOMATIC OAUTH2 PKCE FLOW <<<")
-        print(">>> If the browser shows 'something went wrong', the #1 cause is that the")
-        print(">>> Callback URL printed below is NOT registered exactly in your X app.")
+        LOGGER.info(">>> NO VALID OAUTH2 TOKEN/REFRESH — STARTING AUTOMATIC OAUTH2 PKCE FLOW <<<")
+        LOGGER.info(">>> If the browser shows 'something went wrong', the #1 cause is that the")
+        LOGGER.info(">>> Callback URL printed below is NOT registered exactly in your X app.")
         try:
             access_token, refresh_token = run_oauth2_pkce_flow()
             os.environ["X_OAUTH_ACCESS_TOKEN"] = access_token
@@ -694,7 +743,7 @@ def build_auth_client():
             LOGGER.info("Using freshly obtained OAuth2 bearer token authentication")
             return {"Authorization": f"Bearer {access_token}"}
         except Exception as flow_err:
-            print(f">>> OAuth2 PKCE authorization flow failed: {flow_err}")
+            LOGGER.error(">>> OAuth2 PKCE authorization flow failed: %s", flow_err)
             raise RuntimeError(
                 "OAuth2 authorization is required (CLIENT_ID/CLIENT_SECRET provided) "
                 "but the interactive browser flow did not complete successfully.\n\n"
@@ -720,7 +769,7 @@ def build_auth_client():
 
     if env_access_token and env_access_secret:
         if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-            print("Using pre-existing OAuth1 access token:", env_access_token)
+            LOGGER.info("Using pre-existing OAuth1 access token: %s", env_access_token)
         LOGGER.info("Using pre-existing OAuth1 access token: %s", env_access_token)
         return {
             "client_key": consumer_key,
@@ -730,11 +779,11 @@ def build_auth_client():
         }
 
     # Fall back to browser-based OAuth1 flow (legacy path)
-    print(">>> TRIGGERING OAUTH1 BROWSER FLOW <<<")
+    LOGGER.info(">>> TRIGGERING OAUTH1 BROWSER FLOW <<<")
     access_token, access_secret = run_oauth1_flow()
     if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-        print("OAuth1 access token:", access_token)
-        print("OAuth1 access token secret:", access_secret)
+        LOGGER.info("OAuth1 access token: %s", access_token)
+        LOGGER.info("OAuth1 access token secret: %s", access_secret)
     LOGGER.info("OAuth1 access token: %s", access_token)
     return {
         "client_key": consumer_key,
@@ -872,9 +921,9 @@ def create_mcp() -> FastMCP:
             if print_oauth_header:
                 auth_header = signed_headers.get("Authorization")
                 if auth_header:
-                    print("OAuth1 Authorization header:", auth_header)
+                    LOGGER.debug("OAuth1 Authorization header: %s", auth_header)
                 else:
-                    print("OAuth1 Authorization header missing from signed request.")
+                    LOGGER.debug("OAuth1 Authorization header missing from signed request.")
 
         client = httpx.AsyncClient(
             base_url=base_url,

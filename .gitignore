@@ -8,3 +8,6 @@ env/
 .env.*
 !.env.example
 scripts/
+
+# Server runtime logs (cleared on every startup)
+server.log
